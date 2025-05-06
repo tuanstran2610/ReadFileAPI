@@ -4,6 +4,8 @@ import tempfile
 import cv2
 import pytesseract as pyt
 import fitz
+import pythoncom
+import win32com.client
 from docx import Document
 from docx.oxml.ns import qn
 from flask import Flask, request, jsonify
@@ -19,7 +21,7 @@ app = Flask(__name__)
 # Constants
 TESSERACT_PATH = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
 SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg'}
-TEXT_EXTENSIONS = {'.txt', '.docx', '.doc', '.pdf', '.xlsx', '.xls', '.pptx', '.ppt'}
+TEXT_EXTENSIONS = {'.txt', '.docx', '.pdf', '.xlsx', '.pptx', '.doc', '.xls', '.ppt'}
 
 # Configure Tesseract
 pyt.pytesseract.tesseract_cmd = TESSERACT_PATH
@@ -92,6 +94,54 @@ def extract_images_from_pptx(file_path: str) -> list:
                         images.append(temp_path)
     except Exception as e:
         print(f"Error extracting images from PPTX: {str(e)}")
+    return images
+
+
+def extract_images_from_doc(file_path: str) -> list:
+    """Extract images from a DOC file using COM automation."""
+    images = []
+    try:
+        pythoncom.CoInitialize()
+        word = win32com.client.Dispatch('Word.Application')
+        doc = word.Documents.Open(file_path)
+        for inline_shape in doc.InlineShapes:
+            if inline_shape.Type == 3:  # wdInlineShapePicture
+                temp_path = tempfile.mktemp(suffix='.png')
+                inline_shape.Range.Copy()
+                image = Image.open(io.BytesIO(win32com.client.Dispatch('Paint.Picture').Paste().SaveAsFile(temp_path)))
+                if image.format in ['PNG', 'JPEG']:
+                    images.append(temp_path)
+        doc.Close()
+        word.Quit()
+    except Exception as e:
+        print(f"Error extracting images from DOC: {str(e)}")
+    finally:
+        pythoncom.CoUninitialize()
+    return images
+
+
+def extract_images_from_ppt(file_path: str) -> list:
+    """Extract images from a PPT file using COM automation."""
+    images = []
+    try:
+        pythoncom.CoInitialize()
+        ppt = win32com.client.Dispatch('PowerPoint.Application')
+        presentation = ppt.Presentations.Open(file_path)
+        for slide in presentation.Slides:
+            for shape in slide.Shapes:
+                if shape.Type == 13:  # msoPicture
+                    temp_path = tempfile.mktemp(suffix='.png')
+                    shape.Copy()
+                    image = Image.open(
+                        io.BytesIO(win32com.client.Dispatch('Paint.Picture').Paste().SaveAsFile(temp_path)))
+                    if image.format in ['PNG', 'JPEG']:
+                        images.append(temp_path)
+        presentation.Close()
+        ppt.Quit()
+    except Exception as e:
+        print(f"Error extracting images from PPT: {str(e)}")
+    finally:
+        pythoncom.CoUninitialize()
     return images
 
 
@@ -172,6 +222,82 @@ def read_pptx(file_path: str) -> str:
         return f"Error reading PPTX file: {str(e)}"
 
 
+def read_doc(file_path: str) -> str:
+    """Read text and extract text from images in a DOC file."""
+    try:
+        pythoncom.CoInitialize()
+        word = win32com.client.Dispatch('Word.Application')
+        doc = word.Documents.Open(file_path)
+        text = doc.Content.Text
+
+        # Extract text from images
+        image_paths = extract_images_from_doc(file_path)
+        image_text = ""
+        for image_path in image_paths:
+            img = cv2.imread(image_path)
+            image_text += pyt.image_to_string(img, lang="eng") + "\n"
+            os.unlink(image_path)
+
+        doc.Close()
+        word.Quit()
+        return "\n".join([text, image_text]).strip()
+    except Exception as e:
+        return f"Error reading DOC file: {str(e)}"
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def read_xls(file_path: str) -> str:
+    """Read text from an Excel (.xls) file."""
+    try:
+        pythoncom.CoInitialize()
+        excel = win32com.client.Dispatch('Excel.Application')
+        workbook = excel.Workbooks.Open(file_path)
+        text = []
+        for sheet in workbook.Sheets:
+            for row in range(1, sheet.UsedRange.Rows.Count + 1):
+                for col in range(1, sheet.UsedRange.Columns.Count + 1):
+                    cell_value = sheet.Cells(row, col).Value
+                    if cell_value:
+                        text.append(str(cell_value))
+        workbook.Close()
+        excel.Quit()
+        return "\n".join(text)
+    except Exception as e:
+        return f"Error reading XLS file: {str(e)}"
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def read_ppt(file_path: str) -> str:
+    """Read text and extract text from images in a PowerPoint (.ppt) file."""
+    try:
+        pythoncom.CoInitialize()
+        ppt = win32com.client.Dispatch('PowerPoint.Application')
+        presentation = ppt.Presentations.Open(file_path)
+        text = []
+        for slide in presentation.Slides:
+            for shape in slide.Shapes:
+                if hasattr(shape, 'TextFrame') and shape.TextFrame.HasText:
+                    text.append(shape.TextFrame.TextRange.Text)
+
+        # Extract text from images
+        image_paths = extract_images_from_ppt(file_path)
+        image_text = ""
+        for image_path in image_paths:
+            img = cv2.imread(image_path)
+            image_text += pyt.image_to_string(img, lang="eng") + "\n"
+            os.unlink(image_path)
+
+        presentation.Close()
+        ppt.Quit()
+        return "\n".join([*text, image_text]).strip()
+    except Exception as e:
+        return f"Error reading PPT file: {str(e)}"
+    finally:
+        pythoncom.CoUninitialize()
+
+
 @app.route('/read-file', methods=['POST'])
 def read_file():
     """API endpoint to read content from various file types."""
@@ -196,6 +322,12 @@ def read_file():
             content = clean_text(read_xlsx(file_path))
         elif file_ext == '.pptx':
             content = clean_text(read_pptx(file_path))
+        elif file_ext == '.doc':
+            content = clean_text(read_doc(file_path))
+        elif file_ext == '.xls':
+            content = clean_text(read_xls(file_path))
+        elif file_ext == '.ppt':
+            content = clean_text(read_ppt(file_path))
         else:
             return jsonify({"error": "Unsupported file type"}), 400
 
