@@ -1,341 +1,178 @@
 import os
 import re
-import tempfile
-import cv2
-import pytesseract as pyt
 import fitz
-import pythoncom
-import win32com.client
-from docx import Document
-from docx.oxml.ns import qn
 from flask import Flask, request, jsonify
 from pdf2image import convert_from_path
-from openpyxl import load_workbook
-from pptx import Presentation
-from PIL import Image
-import io
-from zipfile import ZipFile
+import easyocr
+from docx import Document
+import tabula
+import tempfile
+import pandas as pd
 
 app = Flask(__name__)
 
-# Constants
-TESSERACT_PATH = r"C:/Program Files/Tesseract-OCR/tesseract.exe"
-SUPPORTED_IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg'}
-TEXT_EXTENSIONS = {'.txt', '.docx', '.pdf', '.xlsx', '.pptx', '.doc', '.xls', '.ppt'}
+FILE_EXTENSIONS = [".pdf", ".docx", ".txt", ".jpg", ".png", ".jpeg"]
 
-# Configure Tesseract
-pyt.pytesseract.tesseract_cmd = TESSERACT_PATH
+def check_image(filepath):
+    """Check if a PDF contains only images (no extractable text)."""
+    try:
+        doc = fitz.open(filepath)
+        for page in doc:
+            text = page.get_text().strip()
+            if text:
+                doc.close()
+                return False
+        doc.close()
+        return True
+    except Exception as e:
+        print(f"Error checking image PDF: {e}")
+        return True
 
-
-def is_image_file(filepath: str) -> bool:
-    """Check if a PDF file contains only images (no selectable text)."""
-    doc = fitz.open(filepath)
-    for page in doc:
-        if page.get_text().strip():
-            return False
-    return True
-
-
-def clean_text(raw_text: str) -> str:
-    """Remove stray newlines and extra whitespace from text."""
-    return re.sub(r'(?<!\n)\n(?!\n)', ' ', raw_text.strip())
-
-
-def extract_text_with_ocr(file_path: str) -> str:
-    """Extract text from image-based PDFs or image files using OCR."""
-    text = ""
-    if file_path.lower().endswith('.pdf'):
-        images = convert_from_path(file_path)
-        for image in images:
-            temp_path = tempfile.mktemp(suffix='.png')
-            image.save(temp_path, 'PNG')
-            img = cv2.imread(temp_path)
-            text += pyt.image_to_string(img, lang="eng") + "\n"
-            os.unlink(temp_path)
-    elif file_path.lower().endswith(tuple(SUPPORTED_IMAGE_EXTENSIONS)):
-        img = cv2.imread(file_path)
-        text = pyt.image_to_string(img, lang="eng")
+def clean_text(raw_text):
+    """Clean raw text by normalizing whitespace and line breaks."""
+    text = re.sub(r'(?<!\n)\n(?!\n)', ' ', raw_text.strip())
+    text = re.sub(r'\n{2,}', '\n\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' +\n', '\n', text)
     return text.strip()
 
+def preprocess_text(text):
+    """Preprocess text by removing page numbers and unnecessary characters."""
+    text = re.sub(r'(?:Page|Trang)?\s*-?\s*\d+\s*-?', '', text, flags=re.IGNORECASE)
+    text = re.sub(r"[^\w\s.,!?%\-–()]", "", text)
+    return clean_text(text)
 
-def extract_images_from_docx(file_path: str) -> list:
-    """Extract images from a DOCX file."""
-    images = []
+def extract_text_with_ocr(file_path):
+    """Extract text from images or image-based PDFs using EasyOCR."""
     try:
-        with ZipFile(file_path) as docx_zip:
-            for file_info in docx_zip.infolist():
-                if file_info.filename.startswith('word/media/'):
-                    with docx_zip.open(file_info) as file:
-                        image_data = file.read()
-                        image = Image.open(io.BytesIO(image_data))
-                        if image.format in ['PNG', 'JPEG']:
-                            temp_path = tempfile.mktemp(suffix='.png')
-                            image.save(temp_path, 'PNG')
-                            images.append(temp_path)
-    except Exception as e:
-        print(f"Error extracting images from DOCX: {str(e)}")
-    return images
-
-
-def extract_images_from_pptx(file_path: str) -> list:
-    """Extract images from a PPTX file."""
-    images = []
-    try:
-        presentation = Presentation(file_path)
-        for slide in presentation.slides:
-            for shape in slide.shapes:
-                if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
-                    image = shape.image
-                    image_data = image.blob
-                    image_file = Image.open(io.BytesIO(image_data))
-                    if image_file.format in ['PNG', 'JPEG']:
-                        temp_path = tempfile.mktemp(suffix='.png')
-                        image_file.save(temp_path, 'PNG')
-                        images.append(temp_path)
-    except Exception as e:
-        print(f"Error extracting images from PPTX: {str(e)}")
-    return images
-
-
-def extract_images_from_doc(file_path: str) -> list:
-    """Extract images from a DOC file using COM automation."""
-    images = []
-    try:
-        pythoncom.CoInitialize()
-        word = win32com.client.Dispatch('Word.Application')
-        doc = word.Documents.Open(file_path)
-        for inline_shape in doc.InlineShapes:
-            if inline_shape.Type == 3:  # wdInlineShapePicture
+        reader = easyocr.Reader(['vi', 'en'], gpu=False)  # Disable GPU for broader compatibility
+        text = ""
+        if file_path.lower().endswith('.pdf'):
+            images = convert_from_path(file_path, poppler_path=None)  # Ensure poppler is in PATH
+            for i, image in enumerate(images):
                 temp_path = tempfile.mktemp(suffix='.png')
-                inline_shape.Range.Copy()
-                image = Image.open(io.BytesIO(win32com.client.Dispatch('Paint.Picture').Paste().SaveAsFile(temp_path)))
-                if image.format in ['PNG', 'JPEG']:
-                    images.append(temp_path)
-        doc.Close()
-        word.Quit()
+                image.save(temp_path, 'PNG')
+                results = reader.readtext(temp_path, detail=0, paragraph=True)  # Group text into paragraphs
+                text += f"--- Page {i + 1} ---\n" + "\n".join(results) + "\n\n"
+                os.unlink(temp_path)
+        elif file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
+            results = reader.readtext(file_path, detail=0, paragraph=True)
+            text += "\n".join(results)
+        return preprocess_text(text)
     except Exception as e:
-        print(f"Error extracting images from DOC: {str(e)}")
-    finally:
-        pythoncom.CoUninitialize()
-    return images
+        print(f"OCR extraction failed: {e}")
+        return ""
 
-
-def extract_images_from_ppt(file_path: str) -> list:
-    """Extract images from a PPT file using COM automation."""
-    images = []
+def extract_tables_from_pdf(file_path):
+    """Extract tables from PDF using tabula-py with improved formatting."""
     try:
-        pythoncom.CoInitialize()
-        ppt = win32com.client.Dispatch('PowerPoint.Application')
-        presentation = ppt.Presentations.Open(file_path)
-        for slide in presentation.Slides:
-            for shape in slide.Shapes:
-                if shape.Type == 13:  # msoPicture
-                    temp_path = tempfile.mktemp(suffix='.png')
-                    shape.Copy()
-                    image = Image.open(
-                        io.BytesIO(win32com.client.Dispatch('Paint.Picture').Paste().SaveAsFile(temp_path)))
-                    if image.format in ['PNG', 'JPEG']:
-                        images.append(temp_path)
-        presentation.Close()
-        ppt.Quit()
+        # Try lattice first for structured tables, fallback to stream
+        tables = tabula.read_pdf(file_path, pages='all', multiple_tables=True, lattice=True, stream=True)
+        table_texts = []
+        for i, table in enumerate(tables):
+            # Handle missing values and ensure consistent formatting
+            table = table.fillna('')
+            # Convert table to markdown-like format for readability
+            table_text = f"### Table {i + 1}\n"
+            table_text += table.to_markdown(index=False, tablefmt="grid") + "\n\n"
+            table_texts.append(preprocess_text(table_text))
+        return "\n".join(table_texts)
     except Exception as e:
-        print(f"Error extracting images from PPT: {str(e)}")
-    finally:
-        pythoncom.CoUninitialize()
-    return images
+        print(f"PDF table extraction failed: {e}")
+        return ""
 
-
-def read_docx(file_path: str) -> str:
-    """Read text and extract text from images in a DOCX file."""
+def extract_tables_from_docx(file_path):
+    """Extract tables from DOCX with improved formatting."""
     try:
-        # Read text
         doc = Document(file_path)
-        text = "\n".join(para.text for para in doc.paragraphs)
-
-        # Extract text from images
-        image_paths = extract_images_from_docx(file_path)
-        image_text = ""
-        for image_path in image_paths:
-            img = cv2.imread(image_path)
-            image_text += pyt.image_to_string(img, lang="eng") + "\n"
-            os.unlink(image_path)
-
-        return "\n".join([text, image_text]).strip()
+        table_texts = []
+        for i, table in enumerate(doc.tables):
+            table_data = []
+            # Extract column headers if available
+            headers = [cell.text.strip() for cell in table.rows[0].cells] if table.rows else []
+            for row in table.rows:
+                row_data = [cell.text.strip() for cell in row.cells]
+                table_data.append(row_data)
+            # Format as markdown-like table
+            table_text = f"### Table {i + 1}\n"
+            if headers:
+                table_text += "| " + " | ".join(headers) + " |\n"
+                table_text += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+            table_text += "\n".join(["| " + " | ".join(row) + " |" for row in table_data]) + "\n\n"
+            table_texts.append(preprocess_text(table_text))
+        return "\n".join(table_texts)
     except Exception as e:
-        return f"Error reading DOCX file: {str(e)}"
+        print(f"DOCX table extraction failed: {e}")
+        return ""
 
+def extract_text_and_tables(file_path):
+    """Extract text and tables from a file based on its type."""
+    file_name = os.path.basename(file_path)
+    text = ""
+    tables = ""
 
-def read_text_file(file_path: str) -> str:
-    """Read text from a plain text file."""
+    if not os.path.exists(file_path):
+        return {"error": f"File not found: {file_path}"}, file_name
+
+    if not any(file_path.lower().endswith(ext) for ext in FILE_EXTENSIONS):
+        return {"error": f"Unsupported file type: {file_path}. Supported extensions: {', '.join(FILE_EXTENSIONS)}"}, file_name
+
     try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            return file.read()
+        if file_path.lower().endswith(('.jpg', '.png', '.jpeg')) or (
+                file_path.lower().endswith('.pdf') and check_image(file_path)):
+            text = extract_text_with_ocr(file_path)
+        elif file_path.lower().endswith('.pdf'):
+            doc = fitz.open(file_path)
+            text_blocks = []
+            for page_num, page in enumerate(doc, 1):
+                blocks = page.get_text("blocks")  # Extract text as blocks to preserve structure
+                page_text = []
+                for block in blocks:
+                    block_text = block[4].strip()  # Block[4] is the text content
+                    if block_text:
+                        page_text.append(block_text)
+                if page_text:
+                    text_blocks.append(f"--- Page {page_num} ---\n" + "\n".join(page_text))
+            text = "\n\n".join(text_blocks)
+            doc.close()
+            text = preprocess_text(clean_text(text))
+            tables = extract_tables_from_pdf(file_path)
+        elif file_path.lower().endswith('.docx'):
+            doc = Document(file_path)
+            text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
+            text = preprocess_text(clean_text(text))
+            tables = extract_tables_from_docx(file_path)
+        elif file_path.lower().endswith('.txt'):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+            text = preprocess_text(clean_text(text))
+
+        combined_content = f"{text}\n\n{tables}".strip() if tables else text
+        return {"content": combined_content, "file_name": file_name}, file_name
+
     except Exception as e:
-        return f"Error reading text file: {str(e)}"
+        return {"error": f"Error processing file {file_path}: {str(e)}"}, file_name
 
-
-def read_pdf_text(file_path: str) -> str:
-    """Read text from a text-based PDF file."""
-    try:
-        doc = fitz.open(file_path)
-        text = "\n".join(page.get_text() for page in doc)
-        return text
-    except Exception as e:
-        return f"Error reading PDF file: {str(e)}"
-
-
-def read_xlsx(file_path: str) -> str:
-    """Read text from an Excel (.xlsx) file."""
-    try:
-        workbook = load_workbook(file_path, read_only=True)
-        text = []
-        for sheet in workbook:
-            for row in sheet.rows:
-                for cell in row:
-                    if cell.value:
-                        text.append(str(cell.value))
-        return "\n".join(text)
-    except Exception as e:
-        return f"Error reading XLSX file: {str(e)}"
-
-
-def read_pptx(file_path: str) -> str:
-    """Read text and extract text from images in a PowerPoint (.pptx) file."""
-    try:
-        presentation = Presentation(file_path)
-        text = []
-        for slide in presentation.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text") and shape.text:
-                    text.append(shape.text)
-
-        # Extract text from images
-        image_paths = extract_images_from_pptx(file_path)
-        image_text = ""
-        for image_path in image_paths:
-            img = cv2.imread(image_path)
-            image_text += pyt.image_to_string(img, lang="eng") + "\n"
-            os.unlink(image_path)
-
-        return "\n".join([*text, image_text]).strip()
-    except Exception as e:
-        return f"Error reading PPTX file: {str(e)}"
-
-
-def read_doc(file_path: str) -> str:
-    """Read text and extract text from images in a DOC file."""
-    try:
-        pythoncom.CoInitialize()
-        word = win32com.client.Dispatch('Word.Application')
-        doc = word.Documents.Open(file_path)
-        text = doc.Content.Text
-
-        # Extract text from images
-        image_paths = extract_images_from_doc(file_path)
-        image_text = ""
-        for image_path in image_paths:
-            img = cv2.imread(image_path)
-            image_text += pyt.image_to_string(img, lang="eng") + "\n"
-            os.unlink(image_path)
-
-        doc.Close()
-        word.Quit()
-        return "\n".join([text, image_text]).strip()
-    except Exception as e:
-        return f"Error reading DOC file: {str(e)}"
-    finally:
-        pythoncom.CoUninitialize()
-
-
-def read_xls(file_path: str) -> str:
-    """Read text from an Excel (.xls) file."""
-    try:
-        pythoncom.CoInitialize()
-        excel = win32com.client.Dispatch('Excel.Application')
-        workbook = excel.Workbooks.Open(file_path)
-        text = []
-        for sheet in workbook.Sheets:
-            for row in range(1, sheet.UsedRange.Rows.Count + 1):
-                for col in range(1, sheet.UsedRange.Columns.Count + 1):
-                    cell_value = sheet.Cells(row, col).Value
-                    if cell_value:
-                        text.append(str(cell_value))
-        workbook.Close()
-        excel.Quit()
-        return "\n".join(text)
-    except Exception as e:
-        return f"Error reading XLS file: {str(e)}"
-    finally:
-        pythoncom.CoUninitialize()
-
-
-def read_ppt(file_path: str) -> str:
-    """Read text and extract text from images in a PowerPoint (.ppt) file."""
-    try:
-        pythoncom.CoInitialize()
-        ppt = win32com.client.Dispatch('PowerPoint.Application')
-        presentation = ppt.Presentations.Open(file_path)
-        text = []
-        for slide in presentation.Slides:
-            for shape in slide.Shapes:
-                if hasattr(shape, 'TextFrame') and shape.TextFrame.HasText:
-                    text.append(shape.TextFrame.TextRange.Text)
-
-        # Extract text from images
-        image_paths = extract_images_from_ppt(file_path)
-        image_text = ""
-        for image_path in image_paths:
-            img = cv2.imread(image_path)
-            image_text += pyt.image_to_string(img, lang="eng") + "\n"
-            os.unlink(image_path)
-
-        presentation.Close()
-        ppt.Quit()
-        return "\n".join([*text, image_text]).strip()
-    except Exception as e:
-        return f"Error reading PPT file: {str(e)}"
-    finally:
-        pythoncom.CoUninitialize()
-
-
-@app.route('/read-file', methods=['POST'])
-def read_file():
-    """API endpoint to read content from various file types."""
+@app.route('/process_file', methods=['POST'])
+def process_file():
+    """Flask API endpoint to process a file and return extracted content."""
     data = request.get_json()
-    file_path = data.get('filePath')
+    if not data or 'file_path' not in data:
+        return jsonify({"error": "Missing 'file_path' in request body"}), 400
 
-    if not file_path or not os.path.exists(file_path):
-        return jsonify({"error": "File not found"}), 400
+    file_path = data['file_path']
+    result, file_name = extract_text_and_tables(file_path)
+    if "error" in result:
+        return jsonify(result), 400
 
-    file_ext = os.path.splitext(file_path)[1].lower()
+    content = result["content"]
+    if not content:
+        return jsonify({"error": f"No content extracted from {file_path}"}), 400
 
-    try:
-        if file_ext in SUPPORTED_IMAGE_EXTENSIONS or (file_ext == '.pdf' and is_image_file(file_path)):
-            content = clean_text(extract_text_with_ocr(file_path))
-        elif file_ext == '.docx':
-            content = clean_text(read_docx(file_path))
-        elif file_ext == '.txt':
-            content = clean_text(read_text_file(file_path))
-        elif file_ext == '.pdf':
-            content = clean_text(read_pdf_text(file_path))
-        elif file_ext == '.xlsx':
-            content = clean_text(read_xlsx(file_path))
-        elif file_ext == '.pptx':
-            content = clean_text(read_pptx(file_path))
-        elif file_ext == '.doc':
-            content = clean_text(read_doc(file_path))
-        elif file_ext == '.xls':
-            content = clean_text(read_xls(file_path))
-        elif file_ext == '.ppt':
-            content = clean_text(read_ppt(file_path))
-        else:
-            return jsonify({"error": "Unsupported file type"}), 400
+    return jsonify({
+        "file_name": file_name,
+        "content": content
+    }), 200
 
-        return jsonify({"file_content": content}), 200
-
-    except Exception as e:
-        return jsonify({"error": f"Error processing file: {str(e)}"}), 500
-
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=True, host='0.0.0.0', port=5001)
