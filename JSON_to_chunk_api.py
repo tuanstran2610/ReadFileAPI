@@ -1,5 +1,4 @@
 import os
-import json
 import fitz
 import re
 from flask import Flask, request, jsonify
@@ -10,18 +9,23 @@ from qdrant_client.http.models import PointStruct, VectorParams, Distance
 import uuid
 from docx import Document
 from pdf2image import convert_from_path
-import easyocr
 import tempfile
-import torch
 from langchain_experimental.text_splitter import SemanticChunker
-from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+import pytesseract
 
 
 app = Flask(__name__)
 
 FILE_EXTENSIONS = [".pdf", ".docx", ".txt", ".jpg", ".png", ".jpeg"]
 GENERAL_COLLECTION_NAME = "general_documents"
-reader = easyocr.Reader(['vi', 'en'], gpu=False)  # Global easyocr reader, CPU
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Xây dựng đường dẫn đến tesseract.exe trong thư mục Tesseract-OCR
+tesseract_path = os.path.join(current_dir, 'Tesseract-OCR', 'tesseract.exe')
+
+# Cấu hình đường dẫn cho pytesseract
+pytesseract.pytesseract.tesseract_cmd = tesseract_path
 embed_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2",
     model_kwargs={"device": "cpu"}
@@ -63,33 +67,20 @@ def preprocess_text(text):
     text = re.sub(r' +\n', '\n', text)
     return text.strip()
 
-# def extract_text_with_ocr(file_path):
-#     text = ""
-#     if file_path.lower().endswith('.pdf'):
-#         images = convert_from_path(file_path, dpi=150, grayscale=True)
-#         for image in images:
-#             temp_path = tempfile.mktemp(suffix='.png')
-#             image.save(temp_path, 'PNG')
-#             results = reader.readtext(temp_path, detail=0, low_text=0.3)
-#             text += "\n".join(results) + "\n"
-#             os.unlink(temp_path)
-#     elif file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-#         results = reader.readtext(file_path, detail=0, low_text=0.3)
-#         text += "\n".join(results)
-#     return preprocess_text(clean_text(text))
-
 
 def extract_text_from_image_files(file_path):
     """
     Hàm này xử lý các file chỉ chứa ảnh (.png, .jpg, .jpeg, .pdf scan, .docx chứa ảnh)
-    và trả về văn bản đã OCR bằng EasyOCR.
+    và trả về văn bản đã OCR bằng pytesseract.
     """
     text = ""
 
     # Trường hợp file ảnh: .png, .jpg, .jpeg
     if file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-        results = reader.readtext(file_path, detail=0, low_text=0.3)
-        text = "\n".join(results)
+        image = Image.open(file_path)
+        # Sử dụng pytesseract để OCR, chỉ định ngôn ngữ là tiếng Việt và tiếng Anh
+        text = pytesseract.image_to_string(image, lang='vie+eng')
+        image.close()
 
     # Trường hợp PDF scan: dùng pdf2image
     elif file_path.lower().endswith('.pdf'):
@@ -97,9 +88,10 @@ def extract_text_from_image_files(file_path):
         for image in images:
             temp_path = tempfile.mktemp(suffix='.png')
             image.save(temp_path, 'PNG')
-            results = reader.readtext(temp_path, detail=0, low_text=0.3)
-            text += "\n".join(results) + "\n"
+            # Sử dụng pytesseract để OCR
+            text += pytesseract.image_to_string(Image.open(temp_path), lang='vie+eng') + "\n"
             os.unlink(temp_path)
+            image.close()
 
     # Trường hợp DOCX chứa ảnh
     elif file_path.lower().endswith('.docx'):
@@ -112,8 +104,8 @@ def extract_text_from_image_files(file_path):
                     temp_img.write(img_bytes)
                     temp_img_path = temp_img.name
 
-                results = reader.readtext(temp_img_path, detail=0, low_text=0.3)
-                text += "\n".join(results) + "\n"
+                # Sử dụng pytesseract để OCR
+                text += pytesseract.image_to_string(Image.open(temp_img_path), lang='vie+eng') + "\n"
                 os.unlink(temp_img_path)
 
     else:
@@ -147,10 +139,10 @@ def extract_text_from_docx_with_image_and_text(file_path):
                 temp_img.write(img_bytes)
                 temp_img_path = temp_img.name
 
-            # OCR với easyocr
-            ocr_results = reader.readtext(temp_img_path, detail=0, low_text=0.3)
-            if ocr_results:
-                full_text.append("\n".join(ocr_results))
+            # OCR với pytesseract
+            ocr_result = pytesseract.image_to_string(Image.open(temp_img_path), lang='vie+eng')
+            if ocr_result.strip():
+                full_text.append(ocr_result.strip())
             os.unlink(temp_img_path)
 
     combined_text = "\n".join(full_text)
@@ -178,8 +170,9 @@ def extract_text_from_pdf_with_image_and_text(file_path):
             temp_img_path = tempfile.mktemp(suffix=".png")
             pix.save(temp_img_path)
 
-            ocr_result = reader.readtext(temp_img_path, detail=0, low_text=0.3)
-            combined_text += "\n".join(ocr_result) + "\n"
+            # Sử dụng pytesseract để OCR
+            ocr_result = pytesseract.image_to_string(Image.open(temp_img_path), lang='vie+eng')
+            combined_text += ocr_result.strip() + "\n"
             os.unlink(temp_img_path)
 
     doc.close()
@@ -311,7 +304,6 @@ def filter_invalid_chunks(chunks, min_length=30):
             filtered.append(cleaned)
     return filtered
 
-
 def semantic_chunking(text, embed_model):
     try:
         # Khởi tạo SemanticChunker để chia văn bản thành các chunk ngữ nghĩa
@@ -320,25 +312,11 @@ def semantic_chunking(text, embed_model):
             breakpoint_threshold_type="percentile",
             breakpoint_threshold_amount=95
         )
+        # Chia văn bản thành các chunk ngữ nghĩa
         semantic_chunks = semantic_splitter.split_text(text)
-
-        # Khởi tạo RecursiveCharacterTextSplitter với overlap 20%
-        overlap_percentage = 0.2
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Kích thước chunk có thể điều chỉnh
-            chunk_overlap=int(500 * overlap_percentage),
-            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""],
-            is_separator_regex=False
-        )
-
-        # Chia các chunk ngữ nghĩa thành các phần nhỏ hơn với overlap hợp lý
-        final_chunks = []
-        for chunk in semantic_chunks:
-            sub_chunks = splitter.split_text(chunk)
-            final_chunks.extend(sub_chunks)
-
-        # Lọc các chunk quá ngắn (dưới 30 ký tự)
-        return [chunk for chunk in final_chunks if len(chunk) >= 30]
+        
+        # Trả về tất cả các chunk, không lọc chunk ngắn
+        return semantic_chunks
     except Exception as e:
         print(f"Error during chunking: {e}")
         return []
