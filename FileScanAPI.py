@@ -2,23 +2,17 @@ import os
 import fitz
 import re
 from flask import Flask, request, jsonify
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, VectorParams, Distance
-import uuid
 from docx import Document
 from pdf2image import convert_from_path
 import tempfile
-from langchain_experimental.text_splitter import SemanticChunker
 from PIL import Image
 import pytesseract
+import requests
 
 
 app = Flask(__name__)
 
 FILE_EXTENSIONS = [".pdf", ".docx", ".txt", ".jpg", ".png", ".jpeg"]
-GENERAL_COLLECTION_NAME = "general_documents"
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Xây dựng đường dẫn đến tesseract.exe trong thư mục Tesseract-OCR
@@ -26,12 +20,8 @@ tesseract_path = os.path.join(current_dir, 'Tesseract-OCR', 'tesseract.exe')
 
 # Cấu hình đường dẫn cho pytesseract
 pytesseract.pytesseract.tesseract_cmd = tesseract_path
-embed_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2",
-    model_kwargs={"device": "cpu"}
-)
-client = QdrantClient(url="http://localhost:6333")
-created_collections = set()  # Cache for collection existence
+
+QDRANT_SERVER_URL = "http://180.148.1.178:6889/qdrant-storing"
 
 
 def check_image(filepath):
@@ -69,10 +59,7 @@ def preprocess_text(text):
 
 
 def extract_text_from_image_files(file_path):
-    """
-    Hàm này xử lý các file chỉ chứa ảnh (.png, .jpg, .jpeg, .pdf scan, .docx chứa ảnh)
-    và trả về văn bản đã OCR bằng pytesseract.
-    """
+
     text = ""
 
     # Trường hợp file ảnh: .png, .jpg, .jpeg
@@ -115,22 +102,17 @@ def extract_text_from_image_files(file_path):
 
 
 def extract_text_from_docx_with_image_and_text(file_path):
-    """
-    Trích xuất nội dung từ file .docx có cả text và hình ảnh (OCR).
-    Kết hợp cả đoạn văn bản và OCR từ ảnh trong file.
-    """
+ 
     if not file_path.lower().endswith('.docx'):
         raise ValueError("File không phải định dạng .docx")
 
     doc = Document(file_path)
     full_text = []
 
-    # 1. Text từ đoạn văn
     for para in doc.paragraphs:
         if para.text.strip():
             full_text.append(para.text.strip())
 
-    # 2. Text từ ảnh trong docx
     for rel in doc.part._rels:
         target = doc.part._rels[rel].target_ref
         if "image" in target:
@@ -139,7 +121,6 @@ def extract_text_from_docx_with_image_and_text(file_path):
                 temp_img.write(img_bytes)
                 temp_img_path = temp_img.name
 
-            # OCR với pytesseract
             ocr_result = pytesseract.image_to_string(Image.open(temp_img_path), lang='vie+eng')
             if ocr_result.strip():
                 full_text.append(ocr_result.strip())
@@ -150,10 +131,7 @@ def extract_text_from_docx_with_image_and_text(file_path):
 
 
 def extract_text_from_pdf_with_image_and_text(file_path):
-    """
-    Trích xuất nội dung từ PDF có cả text và ảnh (OCR nếu cần).
-    Nếu trang có text → lấy text; nếu không có → OCR ảnh.
-    """
+
     if not file_path.lower().endswith('.pdf'):
         raise ValueError("File không phải định dạng PDF")
 
@@ -295,75 +273,7 @@ def extract_text(file_path):
 
     return text, file_name
 
-
-def filter_invalid_chunks(chunks, min_length=30):
-    filtered = []
-    for chunk in chunks:
-        cleaned = chunk.strip()
-        if len(cleaned) >= min_length and not re.fullmatch(r"[.?!,:;\"']+", cleaned):
-            filtered.append(cleaned)
-    return filtered
-
-def semantic_chunking(text, embed_model):
-    try:
-        # Khởi tạo SemanticChunker để chia văn bản thành các chunk ngữ nghĩa
-        semantic_splitter = SemanticChunker(
-            embeddings=embed_model,
-            breakpoint_threshold_type="percentile",
-            breakpoint_threshold_amount=95
-        )
-        # Chia văn bản thành các chunk ngữ nghĩa
-        semantic_chunks = semantic_splitter.split_text(text)
-        
-        # Trả về tất cả các chunk, không lọc chunk ngắn
-        return semantic_chunks
-    except Exception as e:
-        print(f"Error during chunking: {e}")
-        return []
-
-
-def ensure_collection(client, collection_name, embed_model):
-    if collection_name not in created_collections:
-        try:
-            client.get_collection(collection_name)
-            created_collections.add(collection_name)
-        except:
-            # Get embedding dimension by embedding a dummy text
-            embedding = embed_model.embed_query("test")
-            client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=len(embedding),
-                    distance=Distance.COSINE
-                )
-            )
-            created_collections.add(collection_name)
-
-
-def store_in_qdrant(chunks, file_name, collection_name, form_data, embed_model, client):
-    batch_size = 16
-    embeddings = []
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        embeddings.extend(embed_model.embed_documents(batch))
-
-    points = [
-        PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "file_name": file_name,
-                "chunk_id": i,
-                "text": chunk,
-                **(form_data or {})
-            }
-        )
-        for i, (chunk, embedding) in enumerate(zip(chunks, embeddings))
-    ]
-    client.upsert(collection_name=collection_name, points=points)
-
-
-def process_single_file(file_info, loai_phieu, form_data, embed_model, client):
+def process_single_file(file_info, loai_phieu, form_data):
     file_path = file_info.get('path')
     file_name = file_info.get('file_name')
     file_type = file_info.get('file_type')
@@ -371,6 +281,7 @@ def process_single_file(file_info, loai_phieu, form_data, embed_model, client):
     if not file_path or not file_name or not file_type:
         return {
             "file_name": file_name or "unknown",
+            "file_type": file_type or "unknown",
             "status": "error",
             "message": "Missing file information"
         }
@@ -378,6 +289,7 @@ def process_single_file(file_info, loai_phieu, form_data, embed_model, client):
     if not os.path.exists(file_path):
         return {
             "file_name": file_name,
+            "file_type": file_type,
             "status": "error",
             "message": f"File not found: {file_path}"
         }
@@ -385,6 +297,7 @@ def process_single_file(file_info, loai_phieu, form_data, embed_model, client):
     if not any(file_path.lower().endswith(ext) for ext in FILE_EXTENSIONS):
         return {
             "file_name": file_name,
+            "file_type": file_type,
             "status": "error",
             "message": f"Unsupported file type. Supported extensions: {', '.join(FILE_EXTENSIONS)}"
         }
@@ -394,32 +307,22 @@ def process_single_file(file_info, loai_phieu, form_data, embed_model, client):
         if not text:
             return {
                 "file_name": file_name,
+                "file_type": file_type,
                 "status": "error",
                 "message": "No text extracted"
             }
 
-        chunks = semantic_chunking(text, embed_model)
-        if not chunks:
-            return {
-                "file_name": file_name,
-                "status": "error",
-                "message": "No chunks created"
-            }
-
-        ensure_collection(client, loai_phieu, embed_model)
-        ensure_collection(client, GENERAL_COLLECTION_NAME, embed_model)
-        store_in_qdrant(chunks, file_name, loai_phieu, form_data, embed_model, client)
-        store_in_qdrant(chunks, file_name, GENERAL_COLLECTION_NAME, form_data, embed_model, client)
-
         return {
             "file_name": file_name,
+            "file_type": file_type,
+            "content": text,
             "status": "success",
-            "message": f"Processed: {len(chunks)} chunks created and stored",
-            "content": chunks
+            "message": "File content extracted successfully"
         }
     except Exception as e:
         return {
             "file_name": file_name,
+            "file_type": file_type,
             "status": "error",
             "message": f"Error processing file: {str(e)}"
         }
@@ -443,12 +346,40 @@ def store_documents():
 
         results = []
         for file_info in files:
-            result = process_single_file(file_info, loai_phieu, form_data, embed_model, client)
-            results.append(result)
+            result = process_single_file(file_info, loai_phieu, form_data)
+            file_result = {
+                "file_name": result.get("file_name"),
+                "file_type": result.get("file_type"),
+            }
+
+            if result.get("status") == "success":
+                content = result.get("content", "")
+                file_result["content"] = content
+
+                try:
+                    forward_response = requests.post(
+                        QDRANT_SERVER_URL,
+                        json={
+                            "text": content,
+                            "file_name": result.get("file_name"),
+                            "loai_phieu": loai_phieu,
+                            "form_data": form_data
+                        },
+                        timeout=10  
+                    )
+                    file_result["forward_status"] = forward_response.status_code
+                except Exception as forward_error:
+                    file_result["forward_error"] = str(forward_error)
+
+            else:
+                file_result["error"] = result.get("message")
+
+            results.append(file_result)
 
         return jsonify({
-            "status": "completed",
-            "results": results
+            "loai_phieu": loai_phieu,
+            "formData": form_data,
+            "files": results
         }), 200
 
     except Exception as e:
