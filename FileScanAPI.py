@@ -8,8 +8,13 @@ import tempfile
 from PIL import Image
 import pytesseract
 import requests
+import logging
+
 
 app = Flask(__name__)
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 FILE_EXTENSIONS = [".pdf", ".docx", ".txt", ".jpg", ".png", ".jpeg"]
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -261,6 +266,7 @@ def store_documents():
     try:
         data = request.get_json()
         if not data:
+            logger.error("No JSON data provided")
             return jsonify({"error": "No JSON data provided"}), 400
 
         loai_phieu = data.get('loai_phieu')
@@ -268,14 +274,17 @@ def store_documents():
         files = data.get('files', [])
 
         if not loai_phieu:
+            logger.error("Missing loai_phieu")
             return jsonify({"error": "Missing loai_phieu"}), 400
         if not files:
+            logger.error("No files provided")
             return jsonify({"error": "No files provided"}), 400
 
         results = []
         for file_info in files:
             result = process_single_file(file_info)
             if result["status"] == "error":
+                logger.error(f"File processing error: {result}")
                 return jsonify({
                     "error": result["message"],
                     "file_name": result["file_name"],
@@ -293,13 +302,22 @@ def store_documents():
             "files": results
         }
 
+        logger.debug(f"Payload to QDRANT:\n{payload}")
+        print(f"\n--- Payload to QDRANT ---\n{payload}\n")
+
         try:
             response = requests.post(QDRANT_SERVER_URL, json=payload, timeout=30)
+            logger.info(f"QDRANT response status: {response.status_code}")
+            print(f"QDRANT response status: {response.status_code}")
             return jsonify(response.json()), response.status_code
         except requests.exceptions.RequestException as e:
+            logger.exception("Failed to send data to QDRANT server")
+            print(f"❌ RequestException while sending to QDRANT: {str(e)}")
             return jsonify({"error": f"Failed to send data to QDRANT server: {str(e)}"}), 500
 
     except Exception as e:
+        logger.exception("Unhandled server error")
+        print(f"❌ Server error: {str(e)}")
         return jsonify({"error": f"Server error: {str(e)}"}), 500
 
 if __name__ == '__main__':
