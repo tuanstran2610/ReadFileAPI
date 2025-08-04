@@ -20,7 +20,7 @@ FILE_EXTENSIONS = [".pdf", ".docx", ".txt", ".jpg", ".png", ".jpeg"]
 current_dir = os.path.dirname(os.path.abspath(__file__))
 tesseract_path = os.path.join(current_dir, 'Tesseract-OCR', 'tesseract.exe')
 pytesseract.pytesseract.tesseract_cmd = tesseract_path
-QDRANT_SERVER_URL = "http://180.148.1.178:6889/qdrant-storing"
+QDRANT_SERVER_URL = "http://180.148.1.178:5000/qdrant-storing"
 
 def check_image(filepath):
     doc = fitz.open(filepath)
